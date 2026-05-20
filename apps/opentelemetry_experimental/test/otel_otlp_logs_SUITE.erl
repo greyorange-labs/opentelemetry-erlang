@@ -18,7 +18,10 @@ all() ->
     [body_is_string_value_for_format_args,
      body_is_string_value_for_string_chardata,
      body_is_string_value_for_binary,
-     body_is_string_value_for_atom_report].
+     body_is_string_value_for_atom_report,
+     any_value_charlist_becomes_string,
+     any_value_integer_array_stays_array,
+     any_value_proplist_stays_kvlist].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -81,3 +84,35 @@ body_is_string_value_for_atom_report(_Config) ->
     ?assertMatch(#{value := {string_value, _}}, AnyValue),
     #{value := {string_value, Bin}} = AnyValue,
     ?assert(is_binary(Bin)).
+
+%%--------------------------------------------------------------------
+%% to_any_value/1 regression tests
+%%
+%% Logger metadata commonly contains charlists (?FILE = "/path/foo.erl",
+%% function names rendered via atom_to_list/1, etc). Prior to the fix
+%% these encoded as OTLP array_value of int_value, which surfaced as
+%% `[47, 85, 115, ...]` in Loki for the `file` attribute. The chardata
+%% discriminator must convert charlists to string_value while leaving
+%% non-textual lists (integer arrays, proplists) alone.
+%%--------------------------------------------------------------------
+
+any_value_charlist_becomes_string(_Config) ->
+    %% Typical ?FILE — flat printable charlist.
+    AnyValue = otel_otlp_common:to_any_value("/Users/amar/foo.erl"),
+    ?assertMatch(#{value := {string_value, <<"/Users/amar/foo.erl">>}}, AnyValue).
+
+any_value_integer_array_stays_array(_Config) ->
+    %% Non-printable codepoints (1..8 are control chars) — must remain
+    %% an integer array, not be misinterpreted as a 3-byte string.
+    AnyValue = otel_otlp_common:to_any_value([1, 2, 3]),
+    ?assertMatch(#{value := {array_value, _}}, AnyValue),
+    #{value := {array_value, #{values := Values}}} = AnyValue,
+    ?assertEqual([#{value => {int_value, 1}},
+                  #{value => {int_value, 2}},
+                  #{value => {int_value, 3}}], Values).
+
+any_value_proplist_stays_kvlist(_Config) ->
+    %% Proplist must still be encoded as kvlist_value — the chardata
+    %% discriminator must not steal proplists.
+    AnyValue = otel_otlp_common:to_any_value([{key1, <<"v1">>}, {key2, 42}]),
+    ?assertMatch(#{value := {kvlist_value, _}}, AnyValue).
