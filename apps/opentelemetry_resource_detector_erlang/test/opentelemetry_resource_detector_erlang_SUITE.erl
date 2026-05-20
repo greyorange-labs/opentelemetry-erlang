@@ -20,7 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 
 all() ->
-    [merges_all_detectors].
+    [merges_all_detectors, get_resource_callback_returns_same_attributes].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(opentelemetry_api),
@@ -53,3 +53,17 @@ merges_all_detectors(_Config) ->
     HostArch = maps:get('host.arch', AttrMap),
     ?assert(is_binary(HostArch)),
     ?assert(byte_size(HostArch) > 0).
+
+%% @doc get_resource/1 is the otel_resource_detector behaviour callback; it
+%% must produce the same attribute set as the direct detect/0 entry.
+get_resource_callback_returns_same_attributes(_Config) ->
+    Direct = otel_attributes:map(
+        otel_resource:attributes(opentelemetry_resource_detector_erlang:detect())
+    ),
+    ViaCallback = otel_attributes:map(
+        otel_resource:attributes(opentelemetry_resource_detector_erlang:get_resource(undefined))
+    ),
+    ?assertEqual(maps:keys(Direct), maps:keys(ViaCallback)),
+    %% Spot-check a couple of values for identity.
+    ?assertEqual(maps:get('process.runtime.name', Direct), maps:get('process.runtime.name', ViaCallback)),
+    ?assertEqual(maps:get('host.name', Direct), maps:get('host.name', ViaCallback)).

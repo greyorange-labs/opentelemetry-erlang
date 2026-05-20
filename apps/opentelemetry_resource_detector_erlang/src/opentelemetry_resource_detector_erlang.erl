@@ -22,12 +22,23 @@
 %%%------------------------------------------------------------------------
 -module(opentelemetry_resource_detector_erlang).
 
--export([detect/0]).
+-behaviour(otel_resource_detector).
 
-%% @doc Merges all three detectors into a single resource.
+-export([detect/0, get_resource/1]).
+
+%% @doc Convenience entry-point — same result as {@link get_resource/1},
+%% returned directly without going through the SDK behaviour interface.
 -spec detect() -> otel_resource:t().
 detect() ->
     R1 = beam_runtime_detector:detect(),
     R2 = host_detector:detect(),
     R3 = service_detector:detect(),
     otel_resource:merge(otel_resource:merge(R1, R2), R3).
+
+%% @doc {@link otel_resource_detector} behaviour callback. The SDK's
+%% `resource_detectors' sys.config entry calls this with a per-detector
+%% config term (we ignore it — all our detectors are config-less and
+%% read from the environment / BEAM at detect time).
+-spec get_resource(term()) -> otel_resource:t().
+get_resource(_Config) ->
+    detect().
