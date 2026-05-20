@@ -76,8 +76,16 @@ log_record(#{level := Level,
                           trim(
                             lists:reverse(
                               trim(S, false)), true)),
+                    %% {return, binary} (was list) — otel_otlp_common:to_any_value/1
+                    %% dispatches by Erlang term type: a list of integers is
+                    %% encoded as an OTLP `array_value` of int_values, which
+                    %% causes textual log bodies to render as charlists in
+                    %% backends (Loki shows `[111, 116, ...]` instead of
+                    %% "otel_log_handler installed ..."). Returning a binary
+                    %% forces the `string_value` branch, matching the OTel
+                    %% semantic convention for textual log bodies.
                     re:replace(T,",?\r?\n\s*",", ",
-                               [{return,list}, global, unicode]);
+                               [{return,binary}, global, unicode]);
                 M ->
                     M
             end,
