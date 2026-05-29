@@ -21,7 +21,9 @@ all() ->
      body_is_string_value_for_atom_report,
      any_value_charlist_becomes_string,
      any_value_integer_array_stays_array,
-     any_value_proplist_stays_kvlist].
+     any_value_proplist_stays_kvlist,
+     trace_context_hex_decoded_to_raw_bytes,
+     trace_context_absent_when_no_span].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -116,3 +118,37 @@ any_value_proplist_stays_kvlist(_Config) ->
     %% discriminator must not steal proplists.
     AnyValue = otel_otlp_common:to_any_value([{key1, <<"v1">>}, {key2, 42}]),
     ?assertMatch(#{value := {kvlist_value, _}}, AnyValue).
+
+%% Build a LogRecord from a log event carrying the given extra metadata.
+encode_record(ExtraMeta) ->
+    Scope = opentelemetry:get_application_scope(?MODULE),
+    Event = #{level => info,
+              msg => {string, <<"trace ctx test">>},
+              meta => maps:merge(#{time => erlang:system_time(microsecond)}, ExtraMeta)},
+    [#{log_records := [Record]}] =
+        otel_otlp_logs:to_proto_by_instrumentation_scope(#{Scope => [Event]}, #{}),
+    Record.
+
+trace_context_hex_decoded_to_raw_bytes(_Config) ->
+    %% otel_span:hex_span_ctx/1 puts 32/16-char hex binaries into logger
+    %% metadata. The OTLP LogRecord trace_id/span_id are protobuf `bytes`
+    %% and must be the raw 16/8-byte values — emitting the hex form makes
+    %% the batch export fail and silently drops every log in the flush.
+    TraceHex = <<"ab6a43eb9e934a17038b0387e8d2683b">>,
+    SpanHex  = <<"1d156c0509c82f12">>,
+    Record = encode_record(#{otel_trace_id => TraceHex,
+                             otel_span_id => SpanHex,
+                             otel_trace_flags => <<"01">>}),
+    #{trace_id := TraceId, span_id := SpanId, trace_flags := Flags} = Record,
+    ?assertEqual(16, byte_size(TraceId)),
+    ?assertEqual(8, byte_size(SpanId)),
+    ?assertEqual(binary:decode_hex(TraceHex), TraceId),
+    ?assertEqual(binary:decode_hex(SpanHex), SpanId),
+    ?assertEqual(1, Flags).
+
+trace_context_absent_when_no_span(_Config) ->
+    %% No active span -> no otel_trace_id in metadata -> LogRecord carries
+    %% no trace_id/span_id (and must still encode cleanly).
+    Record = encode_record(#{}),
+    ?assertEqual(error, maps:find(trace_id, Record)),
+    ?assertEqual(error, maps:find(span_id, Record)).

@@ -97,7 +97,13 @@ log_record(#{level := Level,
     DroppedAttributesCount = maps:size(Attributes) - length(Attributes1),
     Flags = 0,
 
-    %% Note: otel_trace_id and otel_span_id from hex_span_ctx are now binaries, not charlists.
+    %% otel_trace_id/otel_span_id arrive as lowercase hex binaries from
+    %% otel_span:hex_span_ctx/1 (32 and 16 chars). The OTLP LogRecord
+    %% trace_id/span_id fields are protobuf `bytes` and MUST carry the raw
+    %% 16/8-byte values — sending the hex form makes the export fail, and
+    %% because otel_log_handler exports the whole batch in one request, a
+    %% single hex-bearing record silently drops every log in that flush.
+    %% Decode hex -> raw bytes here.
     LogRecord = case Metadata of
         #{otel_trace_id := TraceId,
           otel_span_id := SpanId,
@@ -107,13 +113,13 @@ log_record(#{level := Level,
                     erlang:binary_to_integer(TraceFlagsHex, 16);
                 _ -> 0
             end,
-            #{trace_id => TraceId,
-              span_id => SpanId,
+            #{trace_id => hex_id_to_bytes(TraceId, 32),
+              span_id => hex_id_to_bytes(SpanId, 16),
               trace_flags => TraceFlags};
         #{otel_trace_id := TraceId,
           otel_span_id := SpanId} ->
-            #{trace_id => TraceId,
-              span_id => SpanId};
+            #{trace_id => hex_id_to_bytes(TraceId, 32),
+              span_id => hex_id_to_bytes(SpanId, 16)};
         _ ->
             #{}
     end,
@@ -129,6 +135,19 @@ log_record(#{level := Level,
                dropped_attributes_count => DroppedAttributesCount,
                flags                   => Flags
               }.
+
+%% Convert a hex-encoded trace/span id (as produced by otel_span:hex_span_ctx/1)
+%% to the raw bytes the OTLP wire format requires. HexLen is the expected hex
+%% string length (32 for trace_id, 16 for span_id). Defensive: anything that
+%% is not a hex binary of that exact length (already-raw bytes, undefined,
+%% malformed) is returned unchanged.
+-spec hex_id_to_bytes(binary() | term(), non_neg_integer()) -> binary() | term().
+hex_id_to_bytes(Id, HexLen) when is_binary(Id), byte_size(Id) =:= HexLen ->
+    try binary:decode_hex(Id)
+    catch _:_ -> Id
+    end;
+hex_id_to_bytes(Id, _HexLen) ->
+    Id.
 
 format_msg({string, Chardata}, Meta, Config) ->
     format_msg({"~ts", [Chardata]}, Meta, Config);
