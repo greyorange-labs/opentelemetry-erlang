@@ -89,11 +89,25 @@ log_record(#{level := Level,
                 M ->
                     M
             end,
-    Attributes = maps:without([gl, time, report_cb], Metadata),
-    Attributes1 = maps:fold(fun(K, V, Acc) ->
-                                    [#{key => otel_otlp_common:to_binary(K),
-                                       value => otel_otlp_common:to_any_value(V)} | Acc]
-                            end, [], Attributes),
+    %% Strip fields already encoded into the LogRecord protobuf envelope
+    %% (otel_trace_id/span_id/flags → trace_id/span_id/flags fields above),
+    %% plus internal emit flags and standard logger housekeeping keys.
+    Attributes = maps:without([gl, time, report_cb, otel_emit,
+                                otel_trace_id, otel_span_id, otel_trace_flags], Metadata),
+    Attributes1 = maps:fold(fun
+        %% Erlang MFA tuple → "module:function/arity" string.
+        %% The raw tuple serialises as a heterogeneous OTLP array_value
+        %% (two string_values + one int_value), which Elasticsearch rejects
+        %% with illegal_argument_exception under mapping.mode: ecs.
+        (mfa, {M, F, A}, Acc) ->
+            MfaBin = iolist_to_binary(io_lib:format("~w:~w/~w", [M, F, A])),
+            [#{key => <<"mfa">>, value => #{value => {string_value, MfaBin}}} | Acc];
+        (mfa, Other, Acc) ->
+            [#{key => <<"mfa">>, value => otel_otlp_common:to_any_value(Other)} | Acc];
+        (K, V, Acc) ->
+            [#{key => otel_otlp_common:to_binary(K),
+               value => otel_otlp_common:to_any_value(V)} | Acc]
+    end, [], Attributes),
     DroppedAttributesCount = maps:size(Attributes) - length(Attributes1),
     Flags = 0,
 

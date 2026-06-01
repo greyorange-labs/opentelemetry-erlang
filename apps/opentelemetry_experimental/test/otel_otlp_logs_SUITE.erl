@@ -23,7 +23,9 @@ all() ->
      any_value_integer_array_stays_array,
      any_value_proplist_stays_kvlist,
      trace_context_hex_decoded_to_raw_bytes,
-     trace_context_absent_when_no_span].
+     trace_context_absent_when_no_span,
+     mfa_tuple_encoded_as_string,
+     internal_otel_meta_stripped_from_attributes].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -152,3 +154,34 @@ trace_context_absent_when_no_span(_Config) ->
     Record = encode_record(#{}),
     ?assertEqual(error, maps:find(trace_id, Record)),
     ?assertEqual(error, maps:find(span_id, Record)).
+
+mfa_tuple_encoded_as_string(_Config) ->
+    %% Erlang MFA tuples in logger metadata must be encoded as
+    %% "module:function/arity" string_value, NOT as a heterogeneous
+    %% array_value (two strings + one int). Heterogeneous OTLP arrays
+    %% cause Elasticsearch illegal_argument_exception under mapping.mode:ecs.
+    Record = encode_record(#{mfa => {my_module, my_function, 2}}),
+    Attrs = maps:get(attributes, Record),
+    MfaAttrs = [V || #{key := <<"mfa">>, value := V} <- Attrs],
+    ?assertMatch([_], MfaAttrs),
+    [MfaVal] = MfaAttrs,
+    ?assertMatch(#{value := {string_value, <<"my_module:my_function/2">>}}, MfaVal).
+
+internal_otel_meta_stripped_from_attributes(_Config) ->
+    %% otel_trace_id, otel_span_id, otel_trace_flags are already encoded into
+    %% the LogRecord trace_id/span_id/flags protobuf fields — they must NOT
+    %% also appear as log record attributes (redundant, and may confuse
+    %% collector field mapping). otel_emit is an internal butler gate flag
+    %% with no semantic value in the backend.
+    TraceHex = <<"ab6a43eb9e934a17038b0387e8d2683b">>,
+    SpanHex  = <<"1d156c0509c82f12">>,
+    Record = encode_record(#{otel_trace_id => TraceHex,
+                             otel_span_id => SpanHex,
+                             otel_trace_flags => <<"01">>,
+                             otel_emit => true}),
+    Attrs = maps:get(attributes, Record),
+    AttrKeys = [K || #{key := K} <- Attrs],
+    ?assertNot(lists:member(<<"otel_trace_id">>, AttrKeys)),
+    ?assertNot(lists:member(<<"otel_span_id">>, AttrKeys)),
+    ?assertNot(lists:member(<<"otel_trace_flags">>, AttrKeys)),
+    ?assertNot(lists:member(<<"otel_emit">>, AttrKeys)).
