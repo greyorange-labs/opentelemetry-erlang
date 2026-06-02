@@ -25,7 +25,8 @@ all() ->
      trace_context_hex_decoded_to_raw_bytes,
      trace_context_absent_when_no_span,
      mfa_tuple_encoded_as_string,
-     internal_otel_meta_stripped_from_attributes].
+     internal_otel_meta_stripped_from_attributes,
+     severity_text_is_human_readable].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -185,3 +186,26 @@ internal_otel_meta_stripped_from_attributes(_Config) ->
     ?assertNot(lists:member(<<"otel_span_id">>, AttrKeys)),
     ?assertNot(lists:member(<<"otel_trace_flags">>, AttrKeys)),
     ?assertNot(lists:member(<<"otel_emit">>, AttrKeys)).
+
+severity_text_is_human_readable(_Config) ->
+    %% severity_text must be the human-readable level name, NOT the protobuf
+    %% enum name (e.g. "INFO" not "SEVERITY_NUMBER_INFO"). Backends use this
+    %% field for log-level filtering and display in Kibana / Grafana / Datadog.
+    Cases = [{debug,     <<"DEBUG">>},
+             {info,      <<"INFO">>},
+             {notice,    <<"NOTICE">>},
+             {warning,   <<"WARNING">>},
+             {error,     <<"ERROR">>},
+             {critical,  <<"CRITICAL">>},
+             {alert,     <<"ALERT">>},
+             {emergency, <<"EMERGENCY">>}],
+    Scope = opentelemetry:get_application_scope(?MODULE),
+    lists:foreach(fun({Level, ExpectedText}) ->
+        Event = #{level => Level,
+                  msg => {string, <<"test">>},
+                  meta => #{time => erlang:system_time(microsecond)}},
+        [#{log_records := [Record]}] =
+            otel_otlp_logs:to_proto_by_instrumentation_scope(#{Scope => [Event]}, #{}),
+        ?assertEqual(ExpectedText, maps:get(severity_text, Record),
+                     {level, Level})
+    end, Cases).

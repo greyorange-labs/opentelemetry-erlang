@@ -276,19 +276,16 @@ chardata_to_list(Chardata) ->
             throw(Error)
     end.
 
-level_to_severity(emergency)->
-    {'SEVERITY_NUMBER_FATAL', <<"SEVERITY_NUMBER_FATAL">>};
-level_to_severity(alert)->
-    {'SEVERITY_NUMBER_ERROR3', <<"SEVERITY_NUMBER_ERROR3">>};
-level_to_severity(critical)->
-    {'SEVERITY_NUMBER_ERROR2', <<"SEVERITY_NUMBER_ERROR2">>};
-level_to_severity(error)->
-    {'SEVERITY_NUMBER_ERROR', <<"SEVERITY_NUMBER_ERROR">>};
-level_to_severity(warning)->
-    {'SEVERITY_NUMBER_WARN', <<"SEVERITY_NUMBER_WARN">>};
-level_to_severity(notice)->
-    {'SEVERITY_NUMBER_INFO2', <<"SEVERITY_NUMBER_INFO2">>};
-level_to_severity(info)->
-    {'SEVERITY_NUMBER_INFO', <<"SEVERITY_NUMBER_INFO">>};
-level_to_severity(debug)->
-    {'SEVERITY_NUMBER_DEBUG', <<"SEVERITY_NUMBER_DEBUG">>}.
+%% OTel log data model spec §Severity: severity_number is the numeric enum,
+%% severity_text is the "original string representation as known at the source"
+%% — i.e. the Erlang logger level name in uppercase, NOT the protobuf enum name.
+%% Backends (Kibana, Grafana, Datadog) use severity_text for human-readable
+%% level display and filtering; emitting the enum name breaks log-level UX.
+level_to_severity(emergency) -> {'SEVERITY_NUMBER_FATAL',   <<"EMERGENCY">>};
+level_to_severity(alert)     -> {'SEVERITY_NUMBER_ERROR3',  <<"ALERT">>};
+level_to_severity(critical)  -> {'SEVERITY_NUMBER_ERROR2',  <<"CRITICAL">>};
+level_to_severity(error)     -> {'SEVERITY_NUMBER_ERROR',   <<"ERROR">>};
+level_to_severity(warning)   -> {'SEVERITY_NUMBER_WARN',    <<"WARNING">>};
+level_to_severity(notice)    -> {'SEVERITY_NUMBER_INFO2',   <<"NOTICE">>};
+level_to_severity(info)      -> {'SEVERITY_NUMBER_INFO',    <<"INFO">>};
+level_to_severity(debug)     -> {'SEVERITY_NUMBER_DEBUG',   <<"DEBUG">>}.
