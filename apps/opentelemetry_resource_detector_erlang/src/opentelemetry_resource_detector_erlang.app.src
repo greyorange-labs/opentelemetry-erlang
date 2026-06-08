@@ -1,0 +1,9 @@
+{application, opentelemetry_resource_detector_erlang,
+ [{description, "BEAM-aware resource detectors for OpenTelemetry - Java OTel agent parity"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, crypto, opentelemetry_api]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache-2.0"]},
+  {links, []}]}.

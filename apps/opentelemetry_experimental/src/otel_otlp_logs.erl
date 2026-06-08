@@ -76,20 +76,48 @@ log_record(#{level := Level,
                           trim(
                             lists:reverse(
                               trim(S, false)), true)),
+                    %% {return, binary} (was list) — otel_otlp_common:to_any_value/1
+                    %% dispatches by Erlang term type: a list of integers is
+                    %% encoded as an OTLP `array_value` of int_values, which
+                    %% causes textual log bodies to render as charlists in
+                    %% backends (Loki shows `[111, 116, ...]` instead of
+                    %% "otel_log_handler installed ..."). Returning a binary
+                    %% forces the `string_value` branch, matching the OTel
+                    %% semantic convention for textual log bodies.
                     re:replace(T,",?\r?\n\s*",", ",
-                               [{return,list}, global, unicode]);
+                               [{return,binary}, global, unicode]);
                 M ->
                     M
             end,
-    Attributes = maps:without([gl, time, report_cb], Metadata),
-    Attributes1 = maps:fold(fun(K, V, Acc) ->
-                                    [#{key => otel_otlp_common:to_binary(K),
-                                       value => otel_otlp_common:to_any_value(V)} | Acc]
-                            end, [], Attributes),
+    %% Strip fields already encoded into the LogRecord protobuf envelope
+    %% (otel_trace_id/span_id/flags → trace_id/span_id/flags fields above),
+    %% plus internal emit flags and standard logger housekeeping keys.
+    Attributes = maps:without([gl, time, report_cb, otel_emit,
+                                otel_trace_id, otel_span_id, otel_trace_flags], Metadata),
+    Attributes1 = maps:fold(fun
+        %% Erlang MFA tuple → "module:function/arity" string.
+        %% The raw tuple serialises as a heterogeneous OTLP array_value
+        %% (two string_values + one int_value), which Elasticsearch rejects
+        %% with illegal_argument_exception under mapping.mode: ecs.
+        (mfa, {M, F, A}, Acc) ->
+            MfaBin = iolist_to_binary(io_lib:format("~w:~w/~w", [M, F, A])),
+            [#{key => <<"mfa">>, value => #{value => {string_value, MfaBin}}} | Acc];
+        (mfa, Other, Acc) ->
+            [#{key => <<"mfa">>, value => otel_otlp_common:to_any_value(Other)} | Acc];
+        (K, V, Acc) ->
+            [#{key => otel_otlp_common:to_binary(K),
+               value => otel_otlp_common:to_any_value(V)} | Acc]
+    end, [], Attributes),
     DroppedAttributesCount = maps:size(Attributes) - length(Attributes1),
     Flags = 0,
 
-    %% Note: otel_trace_id and otel_span_id from hex_span_ctx are now binaries, not charlists.
+    %% otel_trace_id/otel_span_id arrive as lowercase hex binaries from
+    %% otel_span:hex_span_ctx/1 (32 and 16 chars). The OTLP LogRecord
+    %% trace_id/span_id fields are protobuf `bytes` and MUST carry the raw
+    %% 16/8-byte values — sending the hex form makes the export fail, and
+    %% because otel_log_handler exports the whole batch in one request, a
+    %% single hex-bearing record silently drops every log in that flush.
+    %% Decode hex -> raw bytes here.
     LogRecord = case Metadata of
         #{otel_trace_id := TraceId,
           otel_span_id := SpanId,
@@ -99,13 +127,13 @@ log_record(#{level := Level,
                     erlang:binary_to_integer(TraceFlagsHex, 16);
                 _ -> 0
             end,
-            #{trace_id => TraceId,
-              span_id => SpanId,
+            #{trace_id => hex_id_to_bytes(TraceId, 32),
+              span_id => hex_id_to_bytes(SpanId, 16),
               trace_flags => TraceFlags};
         #{otel_trace_id := TraceId,
           otel_span_id := SpanId} ->
-            #{trace_id => TraceId,
-              span_id => SpanId};
+            #{trace_id => hex_id_to_bytes(TraceId, 32),
+              span_id => hex_id_to_bytes(SpanId, 16)};
         _ ->
             #{}
     end,
@@ -121,6 +149,19 @@ log_record(#{level := Level,
                dropped_attributes_count => DroppedAttributesCount,
                flags                   => Flags
               }.
+
+%% Convert a hex-encoded trace/span id (as produced by otel_span:hex_span_ctx/1)
+%% to the raw bytes the OTLP wire format requires. HexLen is the expected hex
+%% string length (32 for trace_id, 16 for span_id). Defensive: anything that
+%% is not a hex binary of that exact length (already-raw bytes, undefined,
+%% malformed) is returned unchanged.
+-spec hex_id_to_bytes(binary() | term(), non_neg_integer()) -> binary() | term().
+hex_id_to_bytes(Id, HexLen) when is_binary(Id), byte_size(Id) =:= HexLen ->
+    try binary:decode_hex(Id)
+    catch _:_ -> Id
+    end;
+hex_id_to_bytes(Id, _HexLen) ->
+    Id.
 
 format_msg({string, Chardata}, Meta, Config) ->
     format_msg({"~ts", [Chardata]}, Meta, Config);
@@ -235,19 +276,16 @@ chardata_to_list(Chardata) ->
             throw(Error)
     end.
 
-level_to_severity(emergency)->
-    {'SEVERITY_NUMBER_FATAL', <<"SEVERITY_NUMBER_FATAL">>};
-level_to_severity(alert)->
-    {'SEVERITY_NUMBER_ERROR3', <<"SEVERITY_NUMBER_ERROR3">>};
-level_to_severity(critical)->
-    {'SEVERITY_NUMBER_ERROR2', <<"SEVERITY_NUMBER_ERROR2">>};
-level_to_severity(error)->
-    {'SEVERITY_NUMBER_ERROR', <<"SEVERITY_NUMBER_ERROR">>};
-level_to_severity(warning)->
-    {'SEVERITY_NUMBER_WARN', <<"SEVERITY_NUMBER_WARN">>};
-level_to_severity(notice)->
-    {'SEVERITY_NUMBER_INFO2', <<"SEVERITY_NUMBER_INFO2">>};
-level_to_severity(info)->
-    {'SEVERITY_NUMBER_INFO', <<"SEVERITY_NUMBER_INFO">>};
-level_to_severity(debug)->
-    {'SEVERITY_NUMBER_DEBUG', <<"SEVERITY_NUMBER_DEBUG">>}.
+%% OTel log data model spec §Severity: severity_number is the numeric enum,
+%% severity_text is the "original string representation as known at the source"
+%% — i.e. the Erlang logger level name in uppercase, NOT the protobuf enum name.
+%% Backends (Kibana, Grafana, Datadog) use severity_text for human-readable
+%% level display and filtering; emitting the enum name breaks log-level UX.
+level_to_severity(emergency) -> {'SEVERITY_NUMBER_FATAL',   <<"EMERGENCY">>};
+level_to_severity(alert)     -> {'SEVERITY_NUMBER_ERROR3',  <<"ALERT">>};
+level_to_severity(critical)  -> {'SEVERITY_NUMBER_ERROR2',  <<"CRITICAL">>};
+level_to_severity(error)     -> {'SEVERITY_NUMBER_ERROR',   <<"ERROR">>};
+level_to_severity(warning)   -> {'SEVERITY_NUMBER_WARN',    <<"WARNING">>};
+level_to_severity(notice)    -> {'SEVERITY_NUMBER_INFO2',   <<"NOTICE">>};
+level_to_severity(info)      -> {'SEVERITY_NUMBER_INFO',    <<"INFO">>};
+level_to_severity(debug)     -> {'SEVERITY_NUMBER_DEBUG',   <<"DEBUG">>}.

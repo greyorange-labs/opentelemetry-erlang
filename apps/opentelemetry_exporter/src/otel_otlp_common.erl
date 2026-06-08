@@ -73,7 +73,22 @@ to_any_value(Value) when is_map(Value) ->
 to_any_value(Value) when is_tuple(Value) ->
     #{value => {array_value, to_array_value(tuple_to_list(Value))}};
 to_any_value(Value) when is_list(Value) ->
-    to_array_or_kvlist(Value);
+    %% Erlang charlists (e.g. `?FILE`, module names rendered via
+    %% atom_to_list/1) are lists of printable codepoints. The prior
+    %% behaviour encoded them as OTLP `array_value` of `int_value`,
+    %% which surfaced in Loki/Datadog as `[111, 116, ...]` instead of
+    %% the actual string. io_lib:printable_unicode_list/1 returns true
+    %% only for a flat list whose elements are ALL printable Unicode
+    %% codepoints — proplists, nested iolists, and arrays of control-
+    %% range integers like `[1, 2, 3]` all return false and fall
+    %% through to the array/kvlist encoding, preserving prior semantics
+    %% for non-textual lists.
+    case io_lib:printable_unicode_list(Value) of
+        true ->
+            #{value => {string_value, unicode:characters_to_binary(Value)}};
+        false ->
+            to_array_or_kvlist(Value)
+    end;
 to_any_value(Value) ->
     #{value => {string_value, to_binary(io_lib:format("~p", [Value]))}}.
 

@@ -189,6 +189,14 @@ exporting(internal, export, Data=#data{exporter=Exporter,
                                        batch=Batch}) when map_size(Batch) =/= 0 ->
     _ = export(Exporter, Resource, Batch, Config),
     {next_state, idle, Data#data{batch=#{}}};
+exporting(internal, export, Data) ->
+    %% Batch was empty when the scheduled timer fired. Without this clause
+    %% the state machine wedges in `exporting` forever — idle/enter is the
+    %% only place that arms the export_logs timer, and exporting/enter does
+    %% not re-arm it. Subsequent log events enqueue into the batch via
+    %% handle_event(cast, {log, ...}) but never get drained. Returning to
+    %% idle re-arms the timer for the next window.
+    {next_state, idle, Data};
 exporting(EventType, EventContent, Data) ->
     handle_event(EventType, EventContent, Data).
 
