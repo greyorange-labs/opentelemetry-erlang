@@ -22,7 +22,10 @@ all() ->
      populated_first_window_drains,
      config_subkey_settings_are_read,
      legacy_top_level_settings_still_read,
-     config_subkey_takes_precedence_over_top_level].
+     config_subkey_takes_precedence_over_top_level,
+     max_queue_size_enforced_drops_and_reports,
+     on_event_reports_successful_export,
+     export_retried_then_dropped_after_max_retries].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -168,4 +171,115 @@ config_subkey_takes_precedence_over_top_level(_Config) ->
         ?assertEqual(2222, element(?SCHEDULED_DELAY_ELEM, Data))
     after
         remove(Id)
+    end.
+
+%% #data{} element offset for batch_count (appended after batch at 10).
+-define(BATCH_COUNT_ELEM, 11).
+
+max_queue_size_enforced_drops_and_reports(_Config) ->
+    %% max_queue_size is a hard cap on buffered events; anything beyond it
+    %% is dropped and reported via on_event (reason => queue_full).
+    Id = max_queue_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                config => #{max_queue_size => 2,
+                            %% large enough that no export fires mid-test
+                            scheduled_delay_ms => 60000,
+                            exporter => none,
+                            on_event => collector(self())}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        [cast_log(Id) || _ <- lists:seq(1, 5)],
+        S = state(Id),                       %% sync barrier: all casts handled
+        ?assertEqual(2, element(?BATCH_COUNT_ELEM, element(2, S))),
+        ?assertEqual(3, count_events(dropped))
+    after
+        remove(Id)
+    end.
+
+on_event_reports_successful_export(_Config) ->
+    %% A successful batch export reports `exported' with the record count.
+    Id = export_ok_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                config => #{scheduled_delay_ms => 100,
+                            exporter => {otel_log_handler_stub_exporter, #{result => ok}},
+                            on_event => collector(self())}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        [cast_log(Id) || _ <- lists:seq(1, 3)],
+        _ = state(Id),                       %% ensure all 3 enqueued before window
+        case recv_event(exported, 2000) of
+            {exported, Measurements, _} ->
+                ?assertEqual(3, maps:get(count, Measurements));
+            timeout ->
+                ct:fail(no_exported_event)
+        end
+    after
+        remove(Id)
+    end.
+
+export_retried_then_dropped_after_max_retries(_Config) ->
+    %% A failed_retryable batch is retained and retried for max_export_retries
+    %% scheduled windows, then dropped to stop head-of-line blocking.
+    Id = retry_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                config => #{scheduled_delay_ms => 100,
+                            max_export_retries => 2,
+                            exporter => {otel_log_handler_stub_exporter, #{result => failed_retryable}},
+                            on_event => collector(self())}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        cast_log(Id),
+        _ = state(Id),                       %% enqueued before first window
+        {export_failed, _, M1} = recv_event(export_failed, 2000),
+        ?assertEqual(1, maps:get(retry, M1)),
+        {export_failed, _, M2} = recv_event(export_failed, 2000),
+        ?assertEqual(2, maps:get(retry, M2)),
+        {dropped, _, M3} = recv_event(dropped, 2000),
+        ?assertEqual(export_retries_exhausted, maps:get(reason, M3)),
+        ?assertEqual(0, element(?BATCH_COUNT_ELEM, element(2, state(Id))))
+    after
+        remove(Id)
+    end.
+
+%%--------------------------------------------------------------------
+%% Helpers for the observability / queue / retry tests
+%%--------------------------------------------------------------------
+
+%% on_event callback that forwards every event to the given pid.
+collector(Pid) ->
+    fun(Event, Measurements, Metadata) ->
+        Pid ! {otel_event, Event, Measurements, Metadata},
+        ok
+    end.
+
+%% Enqueue one log event directly into the handler's gen_statem, bypassing
+%% logger routing so the test controls exactly what this handler sees.
+cast_log(Id) ->
+    Scope = opentelemetry:instrumentation_scope(<<"test">>, <<>>, <<>>),
+    Event = #{level => info, msg => {string, "x"}, meta => #{}},
+    gen_statem:cast(reg_name(Id), {log, Scope, Event}).
+
+%% Wait for the next on_event with the given tag, ignoring others.
+recv_event(Tag, Timeout) ->
+    receive
+        {otel_event, Tag, Measurements, Metadata} -> {Tag, Measurements, Metadata};
+        {otel_event, _, _, _} -> recv_event(Tag, Timeout)
+    after Timeout -> timeout
+    end.
+
+%% Count already-delivered on_event messages with the given tag.
+count_events(Tag) ->
+    receive
+        {otel_event, Tag, _, _} -> 1 + count_events(Tag);
+        {otel_event, _, _, _} -> count_events(Tag)
+    after 0 -> 0
     end.
