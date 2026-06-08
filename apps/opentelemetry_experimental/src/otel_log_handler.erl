@@ -141,11 +141,19 @@ init([_RegName, Config]) ->
 
     Resource = otel_resource_detector:get_resource(),
 
-    SizeLimit = maps:get(max_queue_size, Config, ?DEFAULT_MAX_QUEUE_SIZE),
-    ExportingTimeout = maps:get(exporting_timeout_ms, Config, ?DEFAULT_EXPORTER_TIMEOUT_MS),
-    ScheduledDelay = maps:get(scheduled_delay_ms, Config, ?DEFAULT_SCHEDULED_DELAY_MS),
+    %% Handler-specific settings are read from the OTP-idiomatic `config`
+    %% sub-map first, falling back to the top level of the handler config
+    %% for backwards compatibility. Nesting under `config` lets callers
+    %% pass a handler config that satisfies `logger:handler_config()`
+    %% (which types `config => term()` but does not model these custom
+    %% keys at the top level), so `logger:add_handler/3` type-checks
+    %% cleanly. See setting/4.
+    Settings = maps:get(config, Config, #{}),
+    SizeLimit = setting(max_queue_size, Settings, Config, ?DEFAULT_MAX_QUEUE_SIZE),
+    ExportingTimeout = setting(exporting_timeout_ms, Settings, Config, ?DEFAULT_EXPORTER_TIMEOUT_MS),
+    ScheduledDelay = setting(scheduled_delay_ms, Settings, Config, ?DEFAULT_SCHEDULED_DELAY_MS),
 
-    ExporterConfig = maps:get(exporter, Config, {opentelemetry_exporter, #{protocol => grpc}}),
+    ExporterConfig = setting(exporter, Settings, Config, {opentelemetry_exporter, #{protocol => grpc}}),
 
     {ok, idle, #data{exporter=undefined,
                      exporter_config=ExporterConfig,
@@ -158,6 +166,17 @@ init([_RegName, Config]) ->
                      exporting_timeout_ms=ExportingTimeout,
                      scheduled_delay_ms=ScheduledDelay,
                      batch=#{}}}.
+
+%% Resolve a handler-specific setting. Precedence:
+%%   1. the OTP-idiomatic `config` sub-map (preferred),
+%%   2. the top level of the handler config (legacy / backwards compat),
+%%   3. the supplied default.
+-spec setting(atom(), map(), map(), term()) -> term().
+setting(Key, Settings, Config, Default) ->
+    case Settings of
+        #{Key := Value} -> Value;
+        _ -> maps:get(Key, Config, Default)
+    end.
 
 callback_mode() ->
     [state_functions, state_enter].

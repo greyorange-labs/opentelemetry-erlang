@@ -19,7 +19,10 @@
 
 all() ->
     [empty_first_window_does_not_wedge,
-     populated_first_window_drains].
+     populated_first_window_drains,
+     config_subkey_settings_are_read,
+     legacy_top_level_settings_still_read,
+     config_subkey_takes_precedence_over_top_level].
 
 init_per_suite(Config) ->
     application:ensure_all_started(opentelemetry_exporter),
@@ -99,6 +102,70 @@ populated_first_window_drains(_Config) ->
         S = state(Id),
         ?assertEqual(idle, state_name(S)),
         ?assertEqual(0, batch_size(S))
+    after
+        remove(Id)
+    end.
+
+%% #data{} record element offsets (element(1) is the `data' tag):
+%%   3 = exporter_config, 8 = scheduled_delay_ms.
+-define(EXPORTER_CONFIG_ELEM, 3).
+-define(SCHEDULED_DELAY_ELEM, 8).
+
+config_subkey_settings_are_read(_Config) ->
+    %% Handler-specific settings nested under the OTP-idiomatic `config'
+    %% sub-map must be honoured. This is what lets a caller pass a handler
+    %% config that satisfies logger:handler_config() (which models
+    %% `config => term()' but not a top-level `exporter' key).
+    Id = config_subkey_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                config => #{scheduled_delay_ms => 4242,
+                            exporter => none}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        {_State, Data} = state(Id),
+        ?assertEqual(4242, element(?SCHEDULED_DELAY_ELEM, Data)),
+        ?assertEqual(none, element(?EXPORTER_CONFIG_ELEM, Data))
+    after
+        remove(Id)
+    end.
+
+legacy_top_level_settings_still_read(_Config) ->
+    %% Backwards compat: settings at the top level of the handler config
+    %% (the pre-existing layout) must still be honoured.
+    Id = legacy_top_level_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                scheduled_delay_ms => 7373,
+                exporter => none},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        {_State, Data} = state(Id),
+        ?assertEqual(7373, element(?SCHEDULED_DELAY_ELEM, Data)),
+        ?assertEqual(none, element(?EXPORTER_CONFIG_ELEM, Data))
+    after
+        remove(Id)
+    end.
+
+config_subkey_takes_precedence_over_top_level(_Config) ->
+    %% When a setting is present in both places, the nested `config'
+    %% sub-map wins.
+    Id = precedence_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                scheduled_delay_ms => 1111,
+                config => #{scheduled_delay_ms => 2222,
+                            exporter => none}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        {_State, Data} = state(Id),
+        ?assertEqual(2222, element(?SCHEDULED_DELAY_ELEM, Data))
     after
         remove(Id)
     end.
