@@ -25,6 +25,7 @@ all() ->
      config_subkey_takes_precedence_over_top_level,
      max_queue_size_enforced_drops_and_reports,
      on_event_reports_successful_export,
+     on_event_metadata_carries_handler_id,
      export_retried_then_dropped_after_max_retries].
 
 init_per_suite(Config) ->
@@ -216,6 +217,31 @@ on_event_reports_successful_export(_Config) ->
         case recv_event(exported, 2000) of
             {exported, Measurements, _} ->
                 ?assertEqual(3, maps:get(count, Measurements));
+            timeout ->
+                ct:fail(no_exported_event)
+        end
+    after
+        remove(Id)
+    end.
+
+on_event_metadata_carries_handler_id(_Config) ->
+    %% Every on_event Metadata must carry `handler => Id` so an embedder
+    %% running one handler per app/signal can label metrics by it.
+    Id = handler_id_test,
+    HConfig = #{id => Id,
+                module => otel_log_handler,
+                level => info,
+                formatter => {logger_formatter, #{}},
+                config => #{scheduled_delay_ms => 100,
+                            exporter => {otel_log_handler_stub_exporter, #{result => ok}},
+                            on_event => collector(self())}},
+    ok = logger:add_handler(Id, otel_log_handler, HConfig),
+    try
+        cast_log(Id),
+        _ = state(Id),
+        case recv_event(exported, 2000) of
+            {exported, _Measurements, Metadata} ->
+                ?assertEqual(Id, maps:get(handler, Metadata));
             timeout ->
                 ct:fail(no_exported_event)
         end

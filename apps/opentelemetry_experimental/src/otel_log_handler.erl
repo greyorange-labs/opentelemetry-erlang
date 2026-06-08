@@ -57,12 +57,14 @@
 %% caught and ignored. Events:
 %% <ul>
 %%   <li>`exported' — a batch was shipped. `Measurements = #{count => N}',
-%%        `Metadata = #{}'. Sum of `count' = "logs actually shipped".</li>
+%%        `Metadata = #{handler => Id}'. Sum of `count' = "logs actually shipped".</li>
 %%   <li>`dropped' — events were discarded. `#{count => N}',
-%%        `#{reason => queue_full | export_retries_exhausted}'.</li>
+%%        `#{reason => queue_full | export_retries_exhausted, handler => Id}'.</li>
 %%   <li>`export_failed' — an export attempt failed. `#{count => N}',
-%%        `#{reason => retryable | not_retryable, ...}'.</li>
+%%        `#{reason => retryable | not_retryable, ..., handler => Id}'.</li>
 %% </ul>
+%% Every event's `Metadata' carries `handler => Id' (the logger handler id),
+%% so an embedder running one handler per app/signal can label metrics by it.
 %%
 %% == Per-application batch processors ==
 %%
@@ -141,7 +143,8 @@
                batch_count        :: non_neg_integer(),
                on_event           :: fun((atom(), map(), map()) -> any()) | undefined,
                max_export_retries :: non_neg_integer(),
-               export_retries     :: non_neg_integer()}).
+               export_retries     :: non_neg_integer(),
+               handler_id         :: logger:handler_id() | undefined}).
 
 start_link(RegName, Config) ->
     gen_statem:start_link({local, RegName}, ?MODULE, [RegName, Config], []).
@@ -249,7 +252,8 @@ init([_RegName, Config]) ->
                      batch_count=0,
                      on_event=OnEvent,
                      max_export_retries=MaxExportRetries,
-                     export_retries=0}}.
+                     export_retries=0,
+                     handler_id=maps:get(id, Config, undefined)}}.
 
 %% Resolve a handler-specific setting. Precedence:
 %%   1. the OTP-idiomatic `config` sub-map (preferred),
@@ -293,24 +297,25 @@ exporting(internal, export, Data=#data{exporter=Exporter,
                                        batch_count=Count,
                                        on_event=OnEvent,
                                        export_retries=Retries,
-                                       max_export_retries=MaxRetries}) when map_size(Batch) =/= 0 ->
+                                       max_export_retries=MaxRetries,
+                                       handler_id=HandlerId}) when map_size(Batch) =/= 0 ->
     case export(Exporter, Resource, Batch, Config) of
         ok ->
-            notify(OnEvent, exported, #{count => Count}, #{}),
+            notify(OnEvent, exported, #{count => Count}, #{handler => HandlerId}),
             {next_state, idle, Data#data{batch=#{}, batch_count=0, export_retries=0}};
         {failed, retryable} when Retries + 1 =< MaxRetries ->
             %% Keep the batch; the next scheduled window retries it. New
             %% events still enqueue (up to max_queue_size), so growth is
             %% bounded. export_retries counts windows, not the batch.
             notify(OnEvent, export_failed, #{count => Count},
-                   #{reason => retryable, retry => Retries + 1, max_retries => MaxRetries}),
+                   #{reason => retryable, retry => Retries + 1, max_retries => MaxRetries, handler => HandlerId}),
             {next_state, idle, Data#data{export_retries=Retries + 1}};
         {failed, retryable} ->
             %% Retries exhausted — drop to stop head-of-line blocking.
-            notify(OnEvent, dropped, #{count => Count}, #{reason => export_retries_exhausted}),
+            notify(OnEvent, dropped, #{count => Count}, #{reason => export_retries_exhausted, handler => HandlerId}),
             {next_state, idle, Data#data{batch=#{}, batch_count=0, export_retries=0}};
         {failed, not_retryable} ->
-            notify(OnEvent, export_failed, #{count => Count}, #{reason => not_retryable}),
+            notify(OnEvent, export_failed, #{count => Count}, #{reason => not_retryable, handler => HandlerId}),
             {next_state, idle, Data#data{batch=#{}, batch_count=0, export_retries=0}}
     end;
 exporting(internal, export, Data) ->
@@ -338,11 +343,12 @@ handle_event({call, _From}, _Msg, _Data) ->
 handle_event(cast, {log, Scope, LogEvent}, Data=#data{batch=Logs,
                                                       batch_count=Count,
                                                       max_queue_size=Max,
-                                                      on_event=OnEvent}) ->
+                                                      on_event=OnEvent,
+                                                      handler_id=HandlerId}) ->
     case Max =/= infinity andalso Count >= Max of
         true ->
             %% Queue full — drop the event rather than grow unbounded.
-            notify(OnEvent, dropped, #{count => 1}, #{reason => queue_full}),
+            notify(OnEvent, dropped, #{count => 1}, #{reason => queue_full, handler => HandlerId}),
             keep_state_and_data;
         false ->
             {keep_state, Data#data{batch=maps:update_with(Scope, fun(V) ->
